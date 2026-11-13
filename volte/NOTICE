@@ -1,0 +1,16 @@
+volte: a host-side VoLTE client (IMS UE) library, the core of MudiVoLTE
+
+Required Notice: Copyright (c) 2026 Arthur Valiullin (https://github.com/xarvel)
+
+This library is licensed under the PolyForm Noncommercial License 1.0.0. The
+terms are in the file LICENSE and at
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Any noncommercial use is permitted, and so are changes and redistribution for
+noncommercial purposes, as long as every copy carries the terms (or their URL)
+and the Required Notice line above. Commercial use needs a separate license
+from the copyright holder.
+
+The repository holds no third-party code. The Go modules named in go.mod and
+the AMR-WB codec libraries that media/amrwb links against (opencore-amr,
+vo-amrwbenc) are used under their own licenses; PROVENANCE.md lists them.

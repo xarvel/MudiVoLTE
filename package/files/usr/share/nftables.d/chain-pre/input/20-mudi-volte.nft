@@ -1,0 +1,10 @@
+# mudi-volte: let the operator's IMS core reach the VoLTE client.
+# The IMS connection (rmnet_dataN) belongs to no fw4 zone, so without these
+# rules inbound calls are rejected once the conntrack entry of our own traffic
+# expires (about 200 s of quiet). ESP carries the protected SIP; after the
+# kernel decrypts it, new TCP connections from the P-CSCF re-enter this chain
+# in clear and are recognised by their IPsec origin. The interface number of
+# the internet and the IMS connection can swap, so every rmnet_data* matches;
+# ESP to the internet address finds no security association and is dropped.
+iifname "rmnet_data*" meta l4proto esp counter accept comment "mudi-volte: IMS ESP in"
+iifname "rmnet_data*" meta ipsec exists counter accept comment "mudi-volte: IMS IPsec in"

@@ -1,0 +1,13 @@
+{
+	"admin/services/mudi-volte": {
+		"title": "Calls & SMS",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "mudi-volte/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-mudi-volte" ]
+		}
+	}
+}

@@ -1,0 +1,12 @@
+{
+    "index": 15,
+    "view": "mudi-volte",
+    "title": "Calls & SMS",
+    "level": 2,
+    "parent": "applications",
+    "parent_icon": "application",
+    "parent_index": 55,
+    "show_mode": [
+        "router"
+    ]
+}

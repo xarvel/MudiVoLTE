@@ -1,0 +1,19 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+[ "$1" = upgrade ] && exit 0
+fw4 -q reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+rmdir /www/luci-static/resources/view/mudi-volte 2>/dev/null
+# nginx forgets the GL admin panel's RPC module.
+nginx -s reload >/dev/null 2>&1 || { [ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1; }
+# prerm gave the modem its own VoLTE back: the data goes as with 'mudi-volte
+# uninstall'. opkg keeps an edited conffile, and /etc/config/mudi-volte holds
+# the phones' SIP passwords. Without the mark (a reinstall, 'mudi-volte
+# uninstall', a removal forced past a failed restore) everything stays.
+if [ "$(cat /var/run/mudi-volte-removal 2>/dev/null)" = restored ]; then
+	rm -rf /etc/mudi-volte /var/run/mudi-volte
+	rm -f /etc/config/mudi-volte /etc/config/mudi-volte-opkg
+	echo "mudi-volte is removed with its settings and phones."
+fi
+rm -f /var/run/mudi-volte-removal
+exit 0

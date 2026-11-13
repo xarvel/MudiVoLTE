@@ -1,0 +1,60 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+# How opkg runs this script (opkg-lede, the package manager of OpenWrt 23.05):
+#   prerm upgrade VERSION  before an upgrade or a downgrade (PKG_UPGRADE=1);
+#                          postinst starts the service again when it is set up.
+#   prerm remove           for a removal: opkg remove, LuCI > System > Software.
+#                          A failure keeps the package, unless opkg runs with
+#                          --force-remove.
+#   prerm remove           also for 'opkg install --force-reinstall', which
+#                          removes the package and then installs it again;
+#                          PKG_UPGRADE is 0 as for a removal.
+# postrm runs once the files are gone. The mark tells it that the modem has
+# its own VoLTE back, so that the data can go too.
+MARK=/var/run/mudi-volte-removal
+rm -f "$MARK"
+
+# opkg_flag FLAG: the opkg that runs this script has FLAG on its command line.
+opkg_flag() {
+	local pid=$PPID n=0 cmd
+	while [ "$n" -lt 3 ] && [ -r "/proc/$pid/cmdline" ]; do
+		cmd=" $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+		case "$cmd" in *[\ /]opkg" $1 "* | *[\ /]opkg\ *" $1 "*) return 0 ;; esac
+		pid=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
+		n=$((n + 1))
+	done
+	return 1
+}
+
+# A reinstall puts everything back as it was: install.sh says so in
+# MUDI_VOLTE_REINSTALL, a reinstall typed by hand shows on opkg's command line.
+# 'mudi-volte uninstall' (MUDI_VOLTE_UNINSTALL) has given the modem back
+# already and removes the data itself.
+if [ "$1" = remove ] && [ -z "${MUDI_VOLTE_REINSTALL:-}${MUDI_VOLTE_UNINSTALL:-}" ] &&
+	! opkg_flag --force-reinstall; then
+	# A removal: the modem's own VoLTE and the router's sleep settings come
+	# back as with 'mudi-volte uninstall', without its question and restart.
+	if /usr/sbin/mudi-volte package-removal; then
+		echo restored >"$MARK"
+	elif opkg_flag --force-remove; then
+		cat >&2 <<'EOF'
+mudi-volte: removed anyway (--force-remove). The modem stays in External VoLTE
+mode, so no calls reach the SIM, and the router's sleep mode stays off.
+/etc/config/mudi-volte and /etc/mudi-volte are kept: install the package again
+to get the phone line back, or to give the modem its own VoLTE back with
+'mudi-volte uninstall'.
+EOF
+	else
+		cat >&2 <<'EOF'
+mudi-volte: not removed. The modem has not taken its own VoLTE settings back,
+and without this package no calls would reach the SIM. The phone line keeps
+working. Try again when the modem answers, or run 'mudi-volte uninstall' over
+SSH. 'opkg remove --force-remove mudi-volte' removes the package anyway and
+leaves the modem in External VoLTE mode.
+EOF
+		exit 1
+	fi
+fi
+/etc/init.d/mudi-volte stop >/dev/null 2>&1
+/etc/init.d/mudi-volte disable >/dev/null 2>&1
+exit 0

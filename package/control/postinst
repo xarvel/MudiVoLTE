@@ -1,0 +1,46 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+# Pre-release builds kept the ESP rule in a file of their own.
+rm -f /usr/share/nftables.d/chain-pre/input/20-mudi-imsd-esp.nft /usr/share/nftables.d/chain-pre/input/20-mudi-voip.nft
+# An upgrade keeps the user's settings; opkg leaves the packaged default next
+# to them as mudi-volte-opkg, which only confuses.
+uci -q get mudi-volte.main >/dev/null && rm -f /etc/config/mudi-volte-opkg
+# The settings hold the phones' SIP passwords; uci keeps the mode on later commits.
+chmod 600 /etc/config/mudi-volte 2>/dev/null
+fw4 -q reload >/dev/null 2>&1 || /etc/init.d/firewall reload >/dev/null 2>&1
+# Phones set up before short numbers existed get one (201, 202, ...), so that
+# other phones can call them from the keypad.
+changed=
+for sec in $(uci -q -X show mudi-volte | sed -n "s/^mudi-volte\.\([^.=]*\)=phone\$/\1/p"); do
+	[ -n "$(uci -q get "mudi-volte.$sec.ext")" ] && continue
+	n=201
+	while uci -q -X show mudi-volte | grep -q "\.ext='$n'\$"; do n=$((n + 1)); done
+	uci set "mudi-volte.$sec.ext=$n"
+	changed=1
+done
+[ -n "$changed" ] && uci commit mudi-volte
+# The web page (LuCI > Services > Calls & SMS) shows up once the menu cache is gone.
+# rpcd gives a LuCI session its access rights at login. A reload (SIGHUP, as
+# luci.mk does) applies the current acl.d files to the sessions already open,
+# without logging anyone out. Otherwise a browser that stayed logged in has no
+# menu entry after the first install, and after an upgrade the page gets an
+# empty answer for whatever the new version reads (missed calls, SMS).
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
+/etc/init.d/rpcd reload 2>/dev/null
+# The GL admin panel (Applications > Calls & SMS): nginx keeps an RPC module
+# once loaded, so after an upgrade its workers must start afresh. GL's init
+# script has no reload (procd then keeps the running instance as it is), so
+# the master gets the signal itself.
+nginx -s reload >/dev/null 2>&1 || { [ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1; }
+if [ "$(uci -q get mudi-volte.main.enabled)" = 1 ]; then
+	/etc/init.d/mudi-volte enable
+	# A running daemon is the old binary when opkg skipped the old prerm.
+	if pidof mudi-imsd >/dev/null; then
+		/etc/init.d/mudi-volte restart
+	else
+		/etc/init.d/mudi-volte start
+	fi
+else
+	echo "mudi-volte is installed. Next step: 'mudi-volte setup' over SSH, or LuCI > Services > Calls & SMS"
+fi
+exit 0

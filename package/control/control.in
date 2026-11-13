@@ -1,0 +1,13 @@
+Package: mudi-volte
+Version: @VERSION@-1
+Depends: libc
+Source: MudiVoLTE
+License: PolyForm-Noncommercial-1.0.0
+Section: net
+Architecture: aarch64_cortex-a53
+Installed-Size: @SIZE@
+Description: VoLTE calls on the GL.iNet Mudi 7 through SIP phones on its Wi-Fi.
+ Switches the Quectel RG650V to its External VoLTE Stack mode, registers the
+ SIM in the operator's IMS from the router itself and bridges calls to SIP
+ apps such as Linphone on phones connected to the router. Phones are set up
+ by scanning a QR code; the web page is under LuCI > Services > Calls & SMS.

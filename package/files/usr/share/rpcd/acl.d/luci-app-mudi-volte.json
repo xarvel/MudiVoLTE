@@ -1,0 +1,32 @@
+{
+	"luci-app-mudi-volte": {
+		"description": "Grant access to mudi-volte (calls through the SIM of the GL.iNet Mudi 7)",
+		"read": {
+			"file": {
+				"/var/run/mudi-volte/state.json": [ "read" ],
+				"/etc/mudi-volte/missed.jsonl": [ "read" ],
+				"/usr/sbin/mudi-volte sms --json": [ "exec" ],
+				"/tmp/mudi-volte-setup.log": [ "read" ],
+				"/tmp/mudi-volte-setup.state": [ "read" ],
+				"/usr/sbin/mudi-imsd status": [ "exec" ],
+				"/usr/sbin/mudi-imsd qr -svg *": [ "exec" ],
+				"/usr/sbin/mudi-volte phone url *": [ "exec" ],
+				"/usr/sbin/mudi-volte logs": [ "exec" ]
+			},
+			"uci": [ "mudi-volte", "network" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/mudi-volte phone add *": [ "exec" ],
+				"/usr/sbin/mudi-volte phone del *": [ "exec" ],
+				"/usr/sbin/mudi-volte phone screen *": [ "exec" ],
+				"/usr/sbin/mudi-volte restart": [ "exec" ],
+				"/usr/sbin/mudi-volte missed clear": [ "exec" ],
+				"/usr/sbin/mudi-volte setup --detach": [ "exec" ],
+				"/usr/sbin/mudi-volte setup --detach *": [ "exec" ],
+				"/usr/sbin/mudi-volte modem builtin --detach": [ "exec" ]
+			},
+			"uci": [ "mudi-volte" ]
+		}
+	}
+}

@@ -1,0 +1,435 @@
+--[[
+    @object-name: mudi-volte
+    @object-desc: Phone calls and SMS through the SIM (MudiVoLTE): the page Applications > Calls & SMS of the GL admin panel
+
+    Every action runs the mudi-volte command line tool, as the LuCI page and
+    SSH do, so all three behave the same. Only the admin of the panel may call
+    these methods (the "root" ACL group passes every check).
+--]]
+
+local uci = require "uci"
+local cjson = require "cjson"
+
+local CLI = "/usr/sbin/mudi-volte"
+local IMSD = "/usr/sbin/mudi-imsd"
+local INIT = "/etc/init.d/mudi-volte"
+local STATE = "/var/run/mudi-volte/state.json"
+local MISSED = "/etc/mudi-volte/missed.jsonl"
+local SETUP_LOG = "/tmp/mudi-volte-setup.log"
+local SETUP_STATE = "/tmp/mudi-volte-setup.state"
+local PUSH_FILE = "/etc/mudi-volte/push.json"
+
+local M = {}
+
+local function readfile(path)
+    local f = io.open(path, "r")
+    if not f then
+        return nil
+    end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+local function quote(s)
+    return "'" .. (tostring(s):gsub("'", "'\\''")) .. "'"
+end
+
+-- run executes a command with its arguments quoted; it returns the output
+-- (stdout and stderr) and the exit code.
+local function run(...)
+    local parts = {}
+    for i, a in ipairs({...}) do
+        parts[i] = quote(a)
+    end
+    local f = io.popen(table.concat(parts, " ") .. " </dev/null 2>&1; echo \"#rc=$?\"")
+    local out = f:read("*a") or ""
+    f:close()
+    local body, rc = out:match("^(.-)#rc=(%d+)%s*$")
+    return body or out, tonumber(rc) or 1
+end
+
+-- detach runs a command in the background: the answer must not wait for a
+-- restart of the service or of the router.
+local function detach(...)
+    local parts = {}
+    for i, a in ipairs({...}) do
+        parts[i] = quote(a)
+    end
+    os.execute("(sleep 1; " .. table.concat(parts, " ") .. ") >/dev/null 2>&1 </dev/null &")
+end
+
+local function trim(s)
+    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function result(out, rc)
+    if rc == 0 then
+        return { ok = true, output = trim(out) }
+    end
+    return { ok = false, error = trim(out) ~= "" and trim(out) or ("exit code " .. rc) }
+end
+
+local function decode(s)
+    if not s or s == "" then
+        return nil
+    end
+    local ok, v = pcall(cjson.decode, s)
+    if ok then
+        return v
+    end
+    return nil
+end
+
+local function valid_name(name)
+    return type(name) == "string" and #name >= 1 and #name <= 32 and name:match("^[%w._-]+$") ~= nil
+end
+
+local function lan_ip(c)
+    local ip = c:get("mudi-volte", "main", "listen")
+    if not ip or ip == "" then
+        ip = c:get("network", "lan", "ipaddr") or "192.168.8.1"
+    end
+    return (ip:gsub("/.*", ""))
+end
+
+local function settings(c)
+    local allow = c:get("mudi-volte", "main", "allow")
+    if type(allow) ~= "table" then
+        allow = allow and { allow } or {}
+    end
+    return {
+        incoming = c:get("mudi-volte", "main", "incoming") or "all",
+        allow = allow,
+        dial = c:get("mudi-volte", "main", "dial") or "*",
+        country = c:get("mudi-volte", "main", "country") or "",
+        ring_sec = tonumber(c:get("mudi-volte", "main", "ring_sec") or "45") or 45,
+        sms = c:get("mudi-volte", "main", "sms") ~= "0",
+        encryption = c:get("mudi-volte", "main", "encryption") ~= "0",
+        plain = c:get("mudi-volte", "main", "plain") ~= "0"
+    }
+end
+
+-- push_info: the linphone.org account that wakes sleeping Linphone and the
+-- phones the daemon has push tokens for (they signed in at least once):
+-- iPhones (APNs) and Android phones (FCM). The password never leaves the
+-- router: only whether one is saved.
+local PUSH_PROVIDERS = { apns = true, ["apns.dev"] = true, fcm = true }
+
+local function push_info(c)
+    local list, seen = {}, {}
+    local saved = decode(readfile(PUSH_FILE))
+    if type(saved) == "table" then
+        for _, p in ipairs(saved) do
+            if type(p) == "table" and PUSH_PROVIDERS[p.provider]
+                and type(p.user) == "string" and not seen[p.user] then
+                seen[p.user] = true
+                list[#list + 1] = p.user
+            end
+        end
+    end
+    table.sort(list)
+    return {
+        login = c:get("mudi-volte", "main", "push_login") or "",
+        password_set = (c:get("mudi-volte", "main", "push_password") or "") ~= "",
+        phones = list
+    }
+end
+
+local function phones(c)
+    local list = {}
+    c:foreach("mudi-volte", "phone", function(s)
+        if s.user then
+            list[#list + 1] = { user = s.user, ext = s.ext or "" }
+        end
+    end)
+    return list
+end
+
+-- missed: the missed calls, newest first.
+local function missed()
+    local list = {}
+    local s = readfile(MISSED) or ""
+    for line in s:gmatch("[^\n]+") do
+        local m = decode(line)
+        if type(m) == "table" and m.time then
+            table.insert(list, 1, m)
+        end
+    end
+    while #list > 200 do
+        table.remove(list)
+    end
+    return list
+end
+
+--[[
+    @method-type: call
+    @method-name: get_status
+    @method-desc: The state of the line, missed calls, phones and settings.
+
+    @out bool    enabled     The setup has been done.
+    @out bool    alive       The service is running.
+    @out object  state       The daemon's state file (phase, registered, number, phones online...).
+    @out array   missed      Missed calls, newest first: time, from, reason.
+    @out array   phones      Phone accounts: user, ext.
+    @out object  settings    incoming, allow, dial, country, ring_sec, sms, encryption.
+    @out object  push        login, password_set, phones: the account for pushes and the phones it can wake.
+--]]
+function M.get_status()
+    local c = uci.cursor()
+    local version = run(CLI, "version")
+    local res = {
+        version = version:match("mudi%-volte (%S+)") or "",
+        enabled = c:get("mudi-volte", "main", "enabled") == "1",
+        alive = false,
+        lan_ip = lan_ip(c),
+        settings = settings(c),
+        push = push_info(c),
+        phones = phones(c),
+        missed = missed()
+    }
+    local st = decode(readfile(STATE))
+    if type(st) == "table" then
+        local _, rc = run(IMSD, "status")
+        res.alive = rc ~= 3 -- mudi-imsd status: 0 registered, 1 running, 3 not running
+        res.state = st
+    end
+    return res
+end
+
+--[[
+    @method-type: call
+    @method-name: get_sms
+    @method-desc: SMS to the SIM, newest first (mudi-volte sms --json).
+    @out array list  time, from, text, via (modem | ims)
+--]]
+function M.get_sms()
+    local out, rc = run(CLI, "sms", "--json")
+    local list = rc == 0 and decode(out) or nil
+    return { list = type(list) == "table" and list or {} }
+end
+
+function M.clear_missed()
+    return result(run(CLI, "missed", "clear"))
+end
+
+--[[
+    @method-type: call
+    @method-name: get_phone
+    @method-desc: How to connect a phone: the setup link, its QR code (SVG) and the manual settings.
+    @in  string name  The phone's login.
+--]]
+function M.get_phone(params)
+    local name = params and params.name
+    if not valid_name(name) then
+        return { ok = false, error = "bad phone name" }
+    end
+    local c = uci.cursor()
+    local res = { ok = false, user = name, domain = lan_ip(c) }
+    -- The transport the QR code sets up, for setting a phone up by hand.
+    local port = c:get("mudi-volte", "main", "port") or "5060"
+    local tls_port = c:get("mudi-volte", "main", "tls_port") or "5061"
+    if c:get("mudi-volte", "main", "encryption") == "0" then
+        res.transport = "UDP on port " .. port
+    elseif c:get("mudi-volte", "main", "plain") == "0" then
+        res.transport = "TLS on port " .. tls_port .. " with SRTP media encryption (SIP without encryption is off)"
+    else
+        res.transport = "TLS on port " .. tls_port ..
+            " with SRTP media encryption, or UDP on port " .. port .. " without encryption"
+    end
+    c:foreach("mudi-volte", "phone", function(s)
+        if s.user == name then
+            res.ok, res.password, res.ext = true, s.password or "", s.ext or ""
+        end
+    end)
+    if not res.ok then
+        res.error = "no such phone"
+        return res
+    end
+    local url, rc = run(CLI, "phone", "url", name)
+    url = trim(url)
+    if rc == 0 and url:match("^https?://") then
+        res.url = url
+        local svg, qrc = run(IMSD, "qr", "-svg", url)
+        if qrc == 0 then
+            res.svg = svg
+        end
+    end
+    return res
+end
+
+function M.add_phone(params)
+    local name = params and params.name
+    if not valid_name(name) then
+        return { ok = false, error = "Phone name: up to 32 letters, digits, dots, dashes or underscores." }
+    end
+    return result(run(CLI, "phone", "add", name))
+end
+
+function M.del_phone(params)
+    local name = params and params.name
+    if not valid_name(name) then
+        return { ok = false, error = "bad phone name" }
+    end
+    return result(run(CLI, "phone", "del", name))
+end
+
+function M.screen_phone(params)
+    local name = params and params.name
+    if not valid_name(name) then
+        return { ok = false, error = "bad phone name" }
+    end
+    return result(run(CLI, "phone", "screen", name))
+end
+
+--[[
+    @method-type: call
+    @method-name: set_config
+    @method-desc: Save the settings and restart the service (calls are offline for about 10 seconds).
+    @in string  incoming  all | allow
+    @in array   allow     Allowed callers when incoming is allow.
+    @in string  dial      * or prefixes separated by spaces (+44 +33).
+    @in string  country   Country code for numbers with a leading 0.
+    @in number  ring_sec  10-120.
+    @in bool    sms       SMS on the phones.
+    @in bool    encryption  Encrypted calls (SIP over TLS, SRTP) for phones set up by QR code.
+    @in bool    plain     SIP without encryption (UDP, TCP) next to TLS; false = TLS only.
+--]]
+function M.set_config(params)
+    if type(params) ~= "table" then
+        return { ok = false, error = "no settings" }
+    end
+    local incoming = params.incoming
+    if incoming ~= "all" and incoming ~= "allow" then
+        return { ok = false, error = "Who may call: all or allow" }
+    end
+    local allow = {}
+    for _, v in ipairs(type(params.allow) == "table" and params.allow or {}) do
+        v = trim(v)
+        if v ~= "" then
+            if not v:match("^%+?[%d ]+$") or #v < 3 or #v > 20 then
+                return { ok = false, error = "Allowed caller " .. v .. ": a phone number, e.g. +447700900123" }
+            end
+            allow[#allow + 1] = v
+        end
+    end
+    local dial = trim(params.dial)
+    if dial == "" then
+        dial = "*"
+    end
+    if dial ~= "*" then
+        for p in dial:gmatch("%S+") do
+            if not p:match("^%+?%d+$") then
+                return { ok = false, error = "Outgoing: * or prefixes such as +44 +33" }
+            end
+        end
+    end
+    local country = trim(params.country)
+    if country ~= "" and (not country:match("^%d+$") or #country > 4) then
+        return { ok = false, error = "Country code: up to 4 digits, e.g. 44" }
+    end
+    local ring = tonumber(params.ring_sec)
+    if not ring or ring < 10 or ring > 120 then
+        return { ok = false, error = "Ring time: 10 to 120 seconds" }
+    end
+    local c = uci.cursor()
+    c:set("mudi-volte", "main", "incoming", incoming)
+    if #allow > 0 then
+        c:set("mudi-volte", "main", "allow", allow)
+    else
+        c:delete("mudi-volte", "main", "allow")
+    end
+    c:set("mudi-volte", "main", "dial", dial)
+    c:set("mudi-volte", "main", "country", country)
+    c:set("mudi-volte", "main", "ring_sec", tostring(math.floor(ring)))
+    c:set("mudi-volte", "main", "sms", params.sms == false and "0" or "1")
+    c:set("mudi-volte", "main", "encryption", params.encryption == false and "0" or "1")
+    c:set("mudi-volte", "main", "plain", params.plain == false and "0" or "1")
+    c:commit("mudi-volte")
+    if c:get("mudi-volte", "main", "enabled") == "1" then
+        detach(INIT, "restart")
+    end
+    return { ok = true }
+end
+
+--[[
+    @method-type: call
+    @method-name: set_push
+    @method-desc: The linphone.org account that wakes sleeping Linphone for calls; restarts the service.
+    @in string  login     Login of subscribe.linphone.org (without @sip.linphone.org); empty = pushes off.
+    @in string  password  Its password; empty keeps the saved one (same login only).
+--]]
+function M.set_push(params)
+    if type(params) ~= "table" then
+        return { ok = false, error = "no settings" }
+    end
+    local login = (trim(params.login):gsub("@sip%.linphone%.org$", ""))
+    local pass = type(params.password) == "string" and params.password or ""
+    local c = uci.cursor()
+    if login == "" then
+        c:delete("mudi-volte", "main", "push_login")
+        c:delete("mudi-volte", "main", "push_password")
+    else
+        if #login > 64 or not login:match("^[%w%.%_%+%-]+$") then
+            return { ok = false, error = "Login: the name of the linphone.org account, letters, digits, dots, dashes, underscores or plus" }
+        end
+        local saved = c:get("mudi-volte", "main", "push_password") or ""
+        if pass == "" and (saved == "" or login ~= (c:get("mudi-volte", "main", "push_login") or "")) then
+            return { ok = false, error = "Enter the password of the linphone.org account" }
+        end
+        if #pass > 128 or pass:find("%c") then
+            return { ok = false, error = "Password: up to 128 characters, no control characters" }
+        end
+        c:set("mudi-volte", "main", "push_login", login)
+        if pass ~= "" then
+            c:set("mudi-volte", "main", "push_password", pass)
+        end
+    end
+    c:commit("mudi-volte")
+    if c:get("mudi-volte", "main", "enabled") == "1" then
+        detach(INIT, "restart")
+    end
+    return { ok = true }
+end
+
+function M.restart()
+    detach(INIT, "restart")
+    return { ok = true }
+end
+
+function M.get_log()
+    local out = run(CLI, "logs")
+    return { log = out }
+end
+
+--[[
+    @method-type: call
+    @method-name: setup
+    @method-desc: First-time setup in the background (the router restarts once); progress and result in get_setup_log.
+--]]
+function M.setup()
+    return result(run(CLI, "setup", "--detach"))
+end
+
+--[[
+    @method-type: call
+    @method-name: get_setup_log
+    @method-desc: The output of the background run of setup or give_back, and how it goes.
+
+    @out string  log    What the run printed, its errors included.
+    @out string  state  "running" (or "running PID"), "restarting" (the router restarts now), "exit CODE" when it ended (0: success), "" before the first run.
+--]]
+function M.get_setup_log()
+    return { log = readfile(SETUP_LOG) or "", state = trim(readfile(SETUP_STATE)) }
+end
+
+--[[
+    @method-type: call
+    @method-name: give_back
+    @method-desc: Give VoLTE back to the modem and restart the router, in the background; progress and result in get_setup_log. A modem that refuses keeps the line working and the router running.
+--]]
+function M.give_back()
+    return result(run(CLI, "modem", "builtin", "--detach"))
+end
+
+return M

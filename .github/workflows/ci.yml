@@ -1,0 +1,96 @@
+# Checks on every push and pull request: the Go library and the daemon (vet,
+# tests, a cross-build for the router), the data-call helper (its tests
+# against a stand-in for the firmware's library), the shell scripts, the GL
+# admin panel page and the syntax of its Lua. The static release build (musl,
+# AMR-WB linked in) needs an arm64 Debian host and stays with
+# scripts/build-static.sh.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/imsd/go.mod
+      - name: AMR-WB codec and ffmpeg for the media tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopencore-amrwb-dev libvo-amrwbenc-dev ffmpeg
+      - name: volte library
+        working-directory: volte
+        run: |
+          go vet ./...
+          go test ./...
+      - name: mudi-imsd daemon
+        working-directory: src/imsd
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Cross-build for the router (no cgo, G.711 only)
+        working-directory: src/imsd
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: go build -trimpath -ldflags "-s -w" -o /dev/null .
+
+  helper:
+    name: Data-call helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: mudi-dsi-helper against a stand-in for the DSI library
+        run: python3 src/dsi-helper/tests/helper.test.py
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        # SC3043: `local` is fine in BusyBox ash and dash; SC2034: the init
+        # script's variables are read by /etc/rc.common; SC1007: `pass= q=`
+        # clears two variables on purpose.
+        run: |
+          shellcheck -s sh -S warning -e SC3043,SC2034,SC1007 \
+            package/install.sh.in package/build.sh \
+            package/control/postinst package/control/prerm package/control/postrm \
+            package/files/usr/sbin/mudi-volte package/files/etc/init.d/mudi-volte \
+            package/tests/run.sh package/toolchain/*.sh scripts/*.sh
+      - name: Setup, restore and display lifecycle
+        run: python3 package/tests/lifecycle.test.py
+
+  web:
+    name: GL admin panel page
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sh package/tests/run.sh
+
+  lua:
+    name: Lua of the GL admin panel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lua 5.1, the version of the router's firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.1
+      - name: Syntax of the RPC module and the parameter checks
+        run: |
+          luac5.1 -p package/files/usr/lib/oui-httpd/rpc/mudi-volte \
+            package/files/usr/share/gl-validator.d/mudi-volte.lua

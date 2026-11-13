@@ -1,0 +1,55 @@
+#!/bin/sh
+# mudi-volte @VERSION@ installer for the GL.iNet Mudi 7 (GL-E5800).
+#
+# On the router (ssh root@192.168.8.1):
+#   wget -qO- @BASE_URL@/install.sh | sh
+# or with the package already copied to the router:
+#   sh install.sh /tmp/mudi-volte_@VERSION@_aarch64_cortex-a53.ipk
+set -e
+
+VERSION=@VERSION@
+BASE_URL=${MUDI_VOLTE_URL:-@BASE_URL@}
+IPK=mudi-volte_${VERSION}_aarch64_cortex-a53.ipk
+SHA256=@SHA256@
+
+fail() {
+	echo "mudi-volte install: $*" >&2
+	exit 1
+}
+
+[ "$(id -u)" = 0 ] || fail "run this as root on the router"
+grep -q E5800 /proc/device-tree/model 2>/dev/null || fail "this installer is for the GL.iNet Mudi 7 (GL-E5800)"
+
+if [ -n "${1:-}" ]; then
+	file=$1
+	[ -f "$file" ] || fail "no such file: $file"
+else
+	file=/tmp/$IPK
+	trap 'rm -f "$file"' EXIT # a downloaded package never outlives the installer, whatever happens
+	echo "Downloading $IPK ..."
+	wget -q -O "$file" "$BASE_URL/$IPK" || uclient-fetch -q -O "$file" "$BASE_URL/$IPK" ||
+		fail "download failed: $BASE_URL/$IPK"
+fi
+echo "$SHA256  $file" | sha256sum -c - >/dev/null 2>&1 ||
+	fail "checksum mismatch: $file is damaged or belongs to another release"
+
+if opkg list-installed mudi-volte | grep -q "^mudi-volte - $VERSION-"; then
+	# opkg removes the package before it installs it again, and runs its prerm
+	# and postrm as for a removal: the mark keeps the modem and the settings.
+	MUDI_VOLTE_REINSTALL=1 opkg install --force-reinstall "$file"
+else
+	# An older release over a newer one is the user's choice: let opkg do it.
+	opkg install --force-downgrade "$file"
+fi
+[ -n "${1:-}" ] || rm -f "$file"
+
+echo
+if [ "$(uci -q get mudi-volte.main.enabled)" = 1 ]; then
+	mudi-volte status || true
+	exit 0
+fi
+if { true </dev/tty; } 2>/dev/null; then
+	echo "Installed. Starting the setup (mudi-volte setup) ..."
+	exec mudi-volte setup </dev/tty
+fi
+echo "Installed. Next step: 'mudi-volte setup', or LuCI > Services > Calls & SMS in the web interface"

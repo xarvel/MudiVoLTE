@@ -1,0 +1,21 @@
+# Build output, packages, toolchain cache
+/build/
+/dist/
+/package/.cache/
+/src/imsd/imsd
+*.ipk
+*.o
+*.a
+*.so
+
+# Packet captures and logs carry SIM identities, phone numbers and push tokens
+*.pcap
+*.pcapng
+*.qmdl
+*.log
+
+# Python bytecode of the capture tools
+__pycache__/
+
+# macOS folder metadata
+.DS_Store

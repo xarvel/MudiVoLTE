@@ -1,0 +1,61 @@
+
+config voip 'main'
+	# 1 after `mudi-volte setup`; the service does nothing while 0.
+	option enabled '0'
+	# Who may call: 'all' rings your phones for every caller, 'allow' only for
+	# the numbers listed in 'allow' (others are declined).
+	option incoming 'all'
+	# list allow '+447700900123'
+	# Outgoing calls from the phones: '*' allows any number, or a list of
+	# prefixes such as '+44 +33'.
+	option dial '*'
+	# Country code for numbers dialled with a leading 0 (e.g. 44 for the UK).
+	# Filled in by setup from the SIM.
+	option country ''
+	# Codecs offered to the phones, best first.
+	option codecs 'G722 PCMU PCMA'
+	# How long the phones ring before the caller is declined, in seconds.
+	option ring_sec '45'
+	# Dial this number from a phone to hear yourself (test without the network);
+	# a message to it comes back.
+	option echo_ext '600'
+	# SMS on the phones: incoming SMS go to every phone as messages, and a
+	# message from a phone to a number goes out as an SMS (to the numbers
+	# 'dial' allows). 0 = SMS stay on the router.
+	option sms '1'
+	# SIP server for the phones: LAN address (empty = network.lan.ipaddr) and port.
+	option listen ''
+	option port '5060'
+	# Encrypted calls: SIP over TLS on tls_port and SRTP audio for the phones
+	# set up by QR code. The router makes its own certificate. UDP stays open
+	# for phones set up before or by hand. 0 = no TLS, the QR code sets up UDP.
+	option encryption '1'
+	option tls_port '5061'
+	# SIP without encryption (UDP and TCP on 'port') next to TLS, for phones
+	# set up by hand or before encryption came. 0 = TLS only: every phone is
+	# set up by QR code, and nothing a phone signs can be read off the Wi-Fi.
+	# Ignored while encryption is 0.
+	option plain '1'
+	# Phone setup by QR code (Linphone): HTTP port on the LAN address, 0 = off.
+	option provision_port '8060'
+	# Pushes that wake a sleeping Linphone for a call (iOS stops it in the
+	# background; Android when its service is killed): a free account from
+	# subscribe.linphone.org signs them. Set with `mudi-volte push login NAME`
+	# (asks the password); empty = no pushes.
+	option push_login ''
+	option push_password ''
+	# How the IPsec security associations go into the kernel: through
+	# netlink (the default), or with 'ip' (iproute2) should netlink misbehave
+	# on a firmware.
+	# option ipsec_tool 'ip'
+	# Operator quirks: P-CSCF addresses in the order to try. Empty = the ones
+	# the network announces for the IMS connection.
+	# list pcscf '192.0.2.28'
+	option log_level 'info'
+
+# One section per phone (added by `mudi-volte phone add NAME`). Other phones
+# call it by its name or by its short number (ext, 201, 202, ...).
+# config phone
+#	option user 'pixel'
+#	option password 'at-least-10-characters'
+#	option ext '201'

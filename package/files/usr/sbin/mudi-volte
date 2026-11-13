@@ -1,0 +1,1089 @@
+#!/bin/sh
+# shellcheck disable=SC3043  # BusyBox ash on the router has local
+# mudi-volte: set up and manage VoLTE calling on the GL.iNet Mudi 7 (GL-E5800).
+#
+#   mudi-volte setup [-y] [--lte-only|--keep-3g] [--phone NAME] [--detach]
+#   mudi-volte status
+#   mudi-volte missed [clear]
+#   mudi-volte sms [--json]
+#   mudi-volte phone add NAME | del NAME | show NAME | list | url NAME | ext NAME NUMBER | screen NAME [SECONDS]
+#   mudi-volte push [login NAME | off]
+#   mudi-volte logs [-f | -a]
+#   mudi-volte start | stop | restart
+#   mudi-volte modem [status | builtin [-y] [--detach]]
+#   mudi-volte uninstall [-y] [--keep-config]
+#   mudi-volte version
+
+VERSION=@VERSION@
+IMSD=/usr/sbin/mudi-imsd
+DSI_HELPER=/usr/sbin/mudi-dsi-helper
+INIT=/etc/init.d/mudi-volte
+DATA=/etc/mudi-volte
+ORIG=$DATA/modem.orig
+STATE=/var/run/mudi-volte/state.json
+MISSED=$DATA/missed.jsonl
+SMS_INBOX=$DATA/sms-inbox.jsonl
+SCREEN_PID=/var/run/mudi-volte/screen.pid
+LOG=/var/log/mudi-volte.log
+SETUP_LOG=/tmp/mudi-volte-setup.log
+# How the background run of detach goes, for the web pages: "running" (then
+# with the PID of its wrapper), "restarting" when the router restarts now,
+# and "exit CODE" at the end, 0 for success.
+SETUP_STATE=/tmp/mudi-volte-setup.state
+YES=0
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'mudi-volte: %s\n' "$*" >&2; }
+die() {
+	warn "$*"
+	exit 1
+}
+
+usage() {
+	sed -n '2,14s/^# \{0,1\}//p' "$0"
+	exit "${1:-0}"
+}
+
+# detach ARGS...: run "mudi-volte ARGS" in the background with its output in
+# $SETUP_LOG, for the web pages: their request must wait neither for the modem
+# nor for a restart. A wrapper ("mudi-volte detached ARGS") writes
+# $SETUP_STATE, so the pages learn how the run ends even when it is killed.
+# One run at a time.
+detach() {
+	local pid
+	pid=$(sed -n 's/^running \([0-9][0-9]*\)$/\1/p' "$SETUP_STATE" 2>/dev/null)
+	if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+		die "a setup or a restore is running already; its progress: $SETUP_LOG"
+	fi
+	rm -f "$SETUP_LOG"
+	# The log shows the number of the line: for the owner only. The redirects
+	# below truncate the file and keep its mode.
+	(umask 077 && : >"$SETUP_LOG")
+	echo running >"$SETUP_STATE"
+	# BusyBox on the Mudi has nohup but no setsid.
+	if command -v setsid >/dev/null; then
+		setsid "$0" detached "$@" >"$SETUP_LOG" 2>&1 </dev/null &
+	else
+		nohup "$0" detached "$@" >"$SETUP_LOG" 2>&1 </dev/null &
+	fi
+	say "Started in the background; progress: $SETUP_LOG"
+}
+
+# detached ARGS...: the wrapper of a run of detach. "mudi-volte ARGS" runs as
+# its child, so that the end of the run reaches $SETUP_STATE also when the
+# child is killed.
+detached() {
+	echo "running $$" >"$SETUP_STATE"
+	MUDI_VOLTE_JOB=1 "$0" "$@"
+	echo "exit $?" >"$SETUP_STATE"
+}
+
+# ask QUESTION DEFAULT(Y|N): 0 = yes. With -y the default answer is taken.
+ask() {
+	local ans hint=y/N
+	[ "$2" = Y ] && hint=Y/n
+	if [ "$YES" = 1 ]; then
+		ans=$2
+	elif { true </dev/tty; } 2>/dev/null; then
+		printf '%s [%s] ' "$1" "$hint" >/dev/tty
+		read -r ans </dev/tty || ans=''
+	else
+		die "no terminal to ask \"$1\": run interactively or add -y"
+	fi
+	case "${ans:-$2}" in [Yy]*) return 0 ;; esac
+	return 1
+}
+
+# --- modem: AT commands through the GL ubus proxy ---
+
+at_raw() {
+	local c
+	c=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+	ubus call modem.CPU.AT get_result_AT "{\"cmd\":\"$c\",\"timeout\":12,\"sub_id\":1}" 2>/dev/null |
+		jsonfilter -e '@.data' 2>/dev/null | tr -d '\r'
+}
+
+# at CMD: a query in the SIM 1 context. GL's background poller (and the
+# service itself) keep switching the AT port's slot, so the slot is pinned in
+# the same AT line as the query; a separate pin call can be overtaken.
+# Right after boot such compound lines can fail; then pin and query apart.
+at() {
+	local i out=''
+	for i in 1 2 3 4 5; do
+		case "$1" in
+		AT+*)
+			out=$(at_raw "AT+QUIMSUB=1;+QUIMSUB?;${1#AT}")
+			case "$out" in
+			*ERROR*) ;;
+			*'+QUIMSUB: 1'*OK*)
+				printf '%s\n' "$out"
+				return 0
+				;;
+			esac
+			;;
+		esac
+		case "$(at_raw 'AT+QUIMSUB=1;+QUIMSUB?')" in
+		*'+QUIMSUB: 1'*)
+			out=$(at_raw "$1")
+			case "$out" in *OK*)
+				printf '%s\n' "$out"
+				return 0
+				;;
+			esac
+			;;
+		esac
+		sleep 1
+	done
+	printf '%s\n' "$out"
+	return 1
+}
+
+# at_set CMD: a write pinned to SIM 1 in the same command line.
+at_set() {
+	local i
+	for i in 1 2 3; do
+		case "$(at_raw "AT+QUIMSUB=1;+${1#AT+}")" in *OK*) return 0 ;; esac
+		sleep 1
+	done
+	return 1
+}
+
+ims_mode() { at 'AT+QCFG="ims"' | sed -n 's/.*+QCFG: "ims",\([0-9]\).*/\1/p' | head -n 1; }
+voice_disable() { at 'AT+QCALLCFG="voice_disable"' | sed -n 's/.*"voice_disable",\([0-9]\).*/\1/p' | head -n 1; }
+mode_pref() { at 'AT+QNWPREFCFG="mode_pref"' | sed -n 's/.*"mode_pref",\([A-Z0-9:]*\).*/\1/p' | head -n 1; }
+voice_domain() { at 'AT+QNWPREFCFG="voice_domain"' | sed -n 's/.*"voice_domain",\([0-9]\).*/\1/p' | head -n 1; }
+ue_usage() { at 'AT+QNWPREFCFG="ue_usage_setting"' | sed -n 's/.*"ue_usage_setting",\([0-9]\).*/\1/p' | head -n 1; }
+
+# Voice over IMS only (voice_domain 1), data centric (ue_usage_setting 1):
+# the modem tells the network it takes no 3G/2G (circuit switched) calls, so
+# the network delivers calls for this SIM over IMS and never pulls the modem
+# into 3G for one (CS fallback). In External VoLTE mode the modem has no voice
+# of its own: such a call would end on voicemail and drop the IMS connection.
+# Data centric keeps the modem on 4G although its own voice is off; 3G stays
+# available for the internet. Works with any operator: no RAT lock.
+VOICE_DOMAIN=1
+UE_USAGE=1
+voice_settings_ok() { [ "$(voice_domain)" = "$VOICE_DOMAIN" ] && [ "$(ue_usage)" = "$UE_USAGE" ]; }
+set_voice_settings() {
+	set_value ue_usage_setting 'QNWPREFCFG="ue_usage_setting"' "$UE_USAGE" "$(ue_usage)" &&
+		set_value voice_domain 'QNWPREFCFG="voice_domain"' "$VOICE_DOMAIN" "$(voice_domain)"
+}
+
+# set_value NAME SETTING VALUE OLD: one write of setup, AT+SETTING,VALUE.
+# OLD, the value read just before, goes on top of the undo list, so that a
+# failed setup puts back what it wrote (setup_failed).
+set_value() {
+	if [ -z "$4" ]; then
+		warn "the modem does not answer: could not read $1"
+		return 1
+	fi
+	if ! at_set "AT+$2,$3"; then
+		warn "the modem refused AT+$2,$3"
+		return 1
+	fi
+	undo="AT+$2,$4
+$undo"
+}
+
+# undo_writes: write the values of the undo list $undo back, newest first.
+# Fails when the modem refuses one of them; the others are still written.
+undo_writes() {
+	local c bad=0
+	while IFS= read -r c; do
+		[ -z "$c" ] || at_set "$c" || bad=1
+	done <<EOF
+$undo
+EOF
+	return "$bad"
+}
+
+# setup_failed: the modem did not take a value of setup (refused it or did
+# not answer). Put back what this run wrote and stop; the service and the
+# router's sleep settings are left as they were, because setup changes them
+# only after the modem took every value.
+setup_failed() {
+	if [ -z "$undo" ] || undo_writes; then
+		# Saved by this run: the next setup saves the values of its own time.
+		[ "$made_orig" = 1 ] && rm -f "$ORIG"
+		die "setup stopped: the modem did not take all the settings that calls need; the values written to it are set back, and the service and the router's sleep settings are unchanged"
+	fi
+	die "setup stopped: the modem did not take all the settings that calls need, nor all the values from before back; the service and the router's sleep settings are unchanged. When the modem answers, run the setup again, or 'mudi-volte modem builtin' to give it its own VoLTE back"
+}
+
+# Re-attach to the network (CFUN 4 -> 1) so that it learns new voice
+# settings; the internet blinks for 10-30 seconds.
+radio_cycle() {
+	local i=0
+	at_raw 'AT+CFUN=4' >/dev/null
+	sleep 6
+	at_raw 'AT+CFUN=1' >/dev/null
+	while [ $i -lt 30 ]; do
+		case "$(at 'AT+CEREG?')" in *'+CEREG: '[0-9],[15]*) return 0 ;; esac
+		sleep 3
+		i=$((i + 1))
+	done
+	warn "the modem is not back on the network after 90 s"
+	return 1
+}
+
+# restart_router: the last step of setup and of a restore. A background run
+# tells the web pages first: they say that the router restarts only now.
+restart_router() {
+	[ -z "${MUDI_VOLTE_JOB:-}" ] || echo restarting >"$SETUP_STATE"
+	modem_reboot
+}
+
+# modem_sync: commit the modem's settings to its flash now. The modem saves a
+# value written by an AT command only 90 s later; a restart before that, by
+# any other way than modem_reboot (the reboot button of LuCI, 'reboot', a
+# power cut), loses it.
+modem_sync() {
+	at_raw 'AT+QEFSSYNC=0' >/dev/null
+	sleep 3
+	sync
+}
+
+# Reboot the modem; on the Mudi this restarts the whole router.
+modem_reboot() {
+	modem_sync
+	at_raw 'AT+CFUN=1,1' >/dev/null
+	sleep 60
+}
+
+# Remember the modem settings before the first change, to restore them later.
+# Settings added in later versions are appended to an existing file.
+save_orig() {
+	mkdir -p "$DATA"
+	if [ ! -s "$ORIG" ]; then
+		local ims vd mp
+		ims=$(ims_mode) vd=$(voice_disable) mp=$(mode_pref)
+		if [ "$ims" = 2 ]; then
+			# Already external (switched by hand): restore to the factory state.
+			ims=0 vd=3
+			printf 'voice_domain=3\nue_usage=0\n' >"$ORIG"
+		else
+			: >"$ORIG"
+		fi
+		printf 'ims=%s\nvoice_disable=%s\nmode_pref=%s\n' "${ims:-0}" "${vd:-3}" "${mp:-AUTO}" >>"$ORIG"
+	fi
+	local v
+	if ! grep -q '^voice_domain=' "$ORIG"; then
+		v=$(voice_domain)
+		[ -n "$v" ] && echo "voice_domain=$v" >>"$ORIG"
+	fi
+	if ! grep -q '^ue_usage=' "$ORIG"; then
+		v=$(ue_usage)
+		[ -n "$v" ] && echo "ue_usage=$v" >>"$ORIG"
+	fi
+}
+
+orig() { sed -n "s/^$1=//p" "$ORIG" 2>/dev/null | head -n 1; }
+
+# GL's power saving (lpm-monitor) suspends the whole router when no Wi-Fi
+# client and no wired link have been seen for a while: the modem goes to
+# CFUN=0, the kernel clock stops, and after a few hours of sleep the router
+# powers itself off. A phone line cannot do that, so setup turns it off and
+# uninstall puts the previous values back. Values live in uci "lpm".
+LPM_KEYS='system_sleep_enable wifi_sleep_time phy_sleep_time auto_shutdown_time'
+LPM_ORIG=$DATA/lpm.orig
+
+power_saving_off() {
+	[ -n "$(uci -q get lpm.global.system_sleep_enable)" ] || return 0 # no lpm on this firmware
+	mkdir -p "$DATA"
+	if [ ! -s "$LPM_ORIG" ]; then
+		local k
+		for k in $LPM_KEYS; do echo "$k=$(uci -q get lpm.global.$k)"; done >"$LPM_ORIG"
+	fi
+	if [ "$(uci -q get lpm.global.system_sleep_enable)" != 0 ] || [ "$(uci -q get lpm.global.wifi_sleep_time)" != 0 ] ||
+		[ "$(uci -q get lpm.global.phy_sleep_time)" != 0 ] || [ "$(uci -q get lpm.global.auto_shutdown_time)" != 0 ]; then
+		say "Turning off the router's sleep mode and auto power-off: a phone line has to stay awake."
+		uci set lpm.global.system_sleep_enable=0
+		uci set lpm.global.wifi_sleep_time=0
+		uci set lpm.global.phy_sleep_time=0
+		uci set lpm.global.auto_shutdown_time=0
+		uci commit lpm
+		[ -x /etc/init.d/lpm_monitor ] && /etc/init.d/lpm_monitor restart >/dev/null 2>&1
+	fi
+}
+
+power_saving_restore() {
+	[ -s "$LPM_ORIG" ] || return 0
+	local k v
+	for k in $LPM_KEYS; do
+		v=$(sed -n "s/^$k=//p" "$LPM_ORIG" | head -n 1)
+		[ -n "$v" ] && uci set "lpm.global.$k=$v"
+	done
+	uci commit lpm
+	[ -x /etc/init.d/lpm_monitor ] && /etc/init.d/lpm_monitor restart >/dev/null 2>&1
+	say "The router's sleep mode settings are back to what they were."
+}
+
+# The IMS data connection requires the helper and the firmware's DSI API.
+# Keep stderr: the loader names a missing library or symbol there.
+check_data_call() {
+	$DSI_HELPER check >/dev/null ||
+		die "mudi-dsi-helper cannot load the firmware's DSI API; reinstall the package or check the firmware"
+}
+
+check_device() {
+	grep -q 'E5800' /proc/device-tree/model 2>/dev/null ||
+		die "this is not a GL.iNet Mudi 7 (GL-E5800): $(tr -d '\0' </proc/device-tree/model 2>/dev/null)"
+	ubus list modem.CPU.AT >/dev/null 2>&1 ||
+		die "the GL modem service (ubus modem.CPU.AT) is missing; GL firmware 4.x is required"
+	check_data_call
+	case "$(at 'ATI')" in
+	*RG650V*) ;;
+	*) die "the modem does not answer as a Quectel RG650V" ;;
+	esac
+	case "$(at 'AT+CPIN?')" in
+	*READY*) ;;
+	*) die "no SIM card in slot 1, or the SIM wants a PIN (unlock it in the GL admin panel first)" ;;
+	esac
+}
+
+# MCC → country calling code, for numbers dialled with a leading 0.
+country_code() {
+	case "$1" in
+	202) echo 30 ;; 204) echo 31 ;; 206) echo 32 ;; 208) echo 33 ;; 214) echo 34 ;;
+	216) echo 36 ;; 218) echo 387 ;; 219) echo 385 ;; 220) echo 381 ;; 222) echo 39 ;;
+	226) echo 40 ;; 228) echo 41 ;; 230) echo 420 ;; 231) echo 421 ;; 232) echo 43 ;;
+	234 | 235) echo 44 ;; 238) echo 45 ;; 240) echo 46 ;; 242) echo 47 ;; 244) echo 358 ;;
+	246) echo 370 ;; 247) echo 371 ;; 248) echo 372 ;; 250) echo 7 ;; 255) echo 380 ;;
+	257) echo 375 ;; 259) echo 373 ;; 260) echo 48 ;; 262) echo 49 ;; 268) echo 351 ;;
+	270) echo 352 ;; 272) echo 353 ;; 274) echo 354 ;; 276) echo 355 ;; 278) echo 356 ;;
+	280) echo 357 ;; 282) echo 995 ;; 283) echo 374 ;; 284) echo 359 ;; 286) echo 90 ;;
+	293) echo 386 ;; 294) echo 389 ;; 297) echo 382 ;; 302) echo 1 ;; 31[0-6]) echo 1 ;;
+	334) echo 52 ;; 400) echo 994 ;; 401) echo 7 ;; 404 | 405) echo 91 ;; 424) echo 971 ;;
+	425) echo 972 ;; 440 | 441) echo 81 ;; 450) echo 82 ;; 460) echo 86 ;; 505) echo 61 ;;
+	520) echo 66 ;; 525) echo 65 ;; 530) echo 64 ;; 722) echo 54 ;; 724) echo 55 ;;
+	esac
+}
+
+lan_ip() {
+	local ip
+	ip=$(uci -q get mudi-volte.main.listen)
+	[ -n "$ip" ] || ip=$(uci -q get network.lan.ipaddr)
+	echo "${ip%%/*}"
+}
+
+service_running() { pidof mudi-imsd >/dev/null 2>&1; }
+
+# (Re)start the service if it is set up; a plain start when it is not running
+# avoids procd's "Command failed ... (Not found)" noise.
+restart_service() {
+	if [ "$(uci -q get mudi-volte.main.enabled)" = 1 ]; then
+		$INIT enable
+		if service_running; then
+			$INIT restart
+		else
+			$INIT start
+		fi
+	fi
+}
+
+# Wait up to $1 seconds for the IMS registration.
+wait_registered() {
+	local t=0
+	printf 'Connecting to the operator'
+	while [ "$t" -lt "$1" ]; do
+		if $IMSD status "$STATE" >/dev/null 2>&1; then
+			say ' done.'
+			return 0
+		fi
+		printf '.'
+		sleep 5
+		t=$((t + 5))
+	done
+	say ' still not registered.'
+	return 1
+}
+
+# --- phones ---
+
+# check_name NAME: the phone name is used in uci keys and sed patterns, so it is
+# validated on every command that takes one, not only on "phone add".
+check_name() {
+	case "${1:-}" in
+	'' | *[!A-Za-z0-9._-]*) die "phone name: letters, digits, dot, dash and underscore only" ;;
+	esac
+	[ ${#1} -le 32 ] || die "phone name: at most 32 characters"
+}
+
+phone_section() {
+	local esc
+	esc=$(printf '%s' "$1" | sed 's/[.]/\\&/g') # a dot would match any character in the sed pattern
+	uci -X show mudi-volte 2>/dev/null | sed -n "s/^mudi-volte\.\([^.]*\)\.user='$esc'\$/\1/p" | head -n 1
+}
+
+phone_users() {
+	uci -X show mudi-volte 2>/dev/null | sed -n "s/^mudi-volte\.[^.]*\.user='\(.*\)'\$/\1/p"
+}
+
+phone_ext() {
+	local sec
+	sec=$(phone_section "$1")
+	[ -n "$sec" ] && uci -q get "mudi-volte.$sec.ext"
+}
+
+# free_ext: the first unused short number from 201 up.
+free_ext() {
+	local n=201 used
+	used=" $(uci -X show mudi-volte 2>/dev/null | sed -n "s/^mudi-volte\.[^.]*\.ext='\(.*\)'\$/\1/p" | tr '\n' ' ') "
+	while case "$used" in *" $n "*) true ;; *) false ;; esac; do
+		n=$((n + 1))
+	done
+	echo "$n"
+}
+
+# Short numbers: 2-6 digits, not starting with 0 or 1, not 911/999 (no
+# emergency or service number may stay inside the house), not the echo test.
+check_ext() {
+	case "$1" in
+	'' | *[!0-9]* | 0* | 1* | 911 | 999) die "short number: 2-6 digits, not starting with 0 or 1, not 911 or 999" ;;
+	esac
+	[ "${#1}" -ge 2 ] && [ "${#1}" -le 6 ] || die "short number: 2-6 digits"
+	[ "$1" != "$(uci -q get mudi-volte.main.echo_ext || echo 600)" ] || die "short number $1 is the echo test"
+}
+
+gen_password() {
+	tr -dc 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789' </dev/urandom 2>/dev/null | head -c 16
+}
+
+# phone_url NAME: the setup link behind the phone's QR code (empty when the
+# QR setup is off). The daemon config is built from UCI, so this works with
+# the service stopped too.
+phone_url() {
+	local conf
+	conf=$(mktemp)
+	if $INIT json >"$conf" 2>/dev/null; then
+		$IMSD -config "$conf" phone-url "$1" 2>/dev/null
+	fi
+	rm -f "$conf"
+}
+
+show_phone() {
+	local sec pass url
+	sec=$(phone_section "$1")
+	[ -n "$sec" ] || die "no phone named \"$1\""
+	pass=$(uci -q get "mudi-volte.$sec.password")
+	url=$(phone_url "$1")
+	say ""
+	say "Phone \"$1\": connect it to this router's Wi-Fi (not the guest network) and"
+	say "install Linphone (free, Android and iPhone)."
+	if [ -n "$url" ]; then
+		cat <<EOF
+
+Easiest: in Linphone choose "Scan QR code" (in the assistant at first start,
+or under remote provisioning / "Fetch remote configuration") and scan this code.
+Linphone sets up the account by itself.
+
+EOF
+		$IMSD qr "$url"
+		cat <<EOF
+
+The same link, to type in instead: $url
+It works only on this router's network. Do not share it: it signs a phone in.
+EOF
+	fi
+	if [ "$(uci -q get mudi-volte.main.encryption)" != 0 ]; then
+		cat <<EOF
+
+The QR code sets up encrypted calls: SIP over TLS and SRTP audio. A phone set
+up before this version calls without encryption until its code is scanned again.
+EOF
+	fi
+	local tls_port
+	tls_port=$(uci -q get mudi-volte.main.tls_port || echo 5061)
+	if [ "$(uci -q get mudi-volte.main.encryption)" != 0 ] && [ "$(uci -q get mudi-volte.main.plain)" = 0 ]; then
+		cat <<EOF
+
+By hand, in any SIP app (Linphone: Assistant > "Use a SIP account"):
+
+    Username:   $1
+    Password:   $pass
+    Domain:     $(lan_ip):$tls_port
+    Transport:  TLS, media encryption SRTP. The router's certificate is
+                self-signed, so the app must not check it (Linphone: the QR
+                code turns the check off). SIP without encryption is off on
+                this router (option plain).
+EOF
+	else
+		cat <<EOF
+
+By hand, in any SIP app (Linphone: Assistant > "Use a SIP account"):
+
+    Username:   $1
+    Password:   $pass
+    Domain:     $(lan_ip)
+    Transport:  UDP
+EOF
+		if [ "$(uci -q get mudi-volte.main.encryption)" != 0 ]; then
+			cat <<EOF
+
+    Or encrypted: transport TLS, domain $(lan_ip):$tls_port,
+    media encryption SRTP. The router's certificate is self-signed, so the
+    app must not check it (Linphone: the QR code turns the check off).
+EOF
+		fi
+	fi
+	cat <<EOF
+
+Call 600 to hear yourself: that checks the phone without the mobile network.
+Other phones on this router call this one by its name, $1$(ext=$(phone_ext "$1") && [ -n "$ext" ] && printf ', or %s' "$ext"); such calls
+stay inside the house and cost nothing.
+On Android, let Linphone run without battery restrictions, or calls arrive late.
+EOF
+}
+
+phone_add() {
+	local name=$1 sec
+	case "$name" in
+	'' | *[!A-Za-z0-9._-]*) die "phone name: letters, digits, dot, dash and underscore only" ;;
+	esac
+	[ "${#name}" -le 32 ] || die "phone name: 32 characters at most"
+	[ -z "$(phone_section "$name")" ] || die "a phone named \"$name\" already exists"
+	local ext
+	ext=$(free_ext)
+	sec=$(uci add mudi-volte phone)
+	uci set "mudi-volte.$sec.user=$name"
+	uci set "mudi-volte.$sec.password=$(gen_password)"
+	uci set "mudi-volte.$sec.ext=$ext"
+	uci commit mudi-volte
+}
+
+# phone screen NAME [SECONDS]: the connection QR code on the router's own display,
+# so the phone can scan it without a computer. gl_screen (GL.iNet's LVGL user
+# interface) owns the display and has no API for extra pages, so the background
+# half of this command stops it for the duration and starts it again afterwards.
+screen_show() {
+	local name=$1 secs=${2:-90} url
+	[ -n "$(phone_section "$name")" ] || die "no phone named \"$name\""
+	[ -e /dev/fb0 ] || die "this router has no display"
+	case "$secs" in '' | *[!0-9]*) die "usage: mudi-volte phone screen NAME [SECONDS]" ;; esac
+	url=$(phone_url "$name")
+	[ -n "$url" ] || die "no connection link for \"$name\": run 'mudi-volte setup' first"
+	mkdir -p "${SCREEN_PID%/*}"
+	nohup "$0" phone screen-loop "$name" "$secs" "$url" >/dev/null 2>&1 </dev/null &
+	say "Shown on the router's display for $secs s, then it closes by itself. A tap closes it early only when the display was already awake (while mudi-volte owns the screen the touch controller does not report to it from sleep)."
+}
+
+# The background half of "phone screen" (a separate process, so \$\$ and traps are
+# its own). A second call hands the display over: the previous process gets USR1
+# and exits without starting gl_screen, the new one skips stopping it.
+screen_loop() {
+	local name=$1 secs=$2 url=$3 old
+	# EXIT runs after this function returns: these two must outlive its locals.
+	child='' handoff=0
+	old=$(cat "$SCREEN_PID" 2>/dev/null)
+	if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+		kill -USR1 "$old"
+		sleep 1
+	else
+		/etc/init.d/gl_screen stop >/dev/null 2>&1
+		# gl_screen ignores SIGTERM; procd sends SIGKILL after 5 s. Draw only once it
+		# is gone, or its last repaint lands on top of the code.
+		local i=0
+		while pidof gl_screen >/dev/null 2>&1 && [ $i -lt 80 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+	fi
+	echo $$ >"$SCREEN_PID"
+	trap 'handoff=1; kill $child 2>/dev/null' USR1
+	trap 'kill $child 2>/dev/null; [ "$handoff" = 1 ] || /etc/init.d/gl_screen start >/dev/null 2>&1; [ "$(cat "$SCREEN_PID" 2>/dev/null)" = "$$" ] && rm -f "$SCREEN_PID"' EXIT
+	$IMSD screen-qr -name "$name" -seconds "$secs" "$url" &
+	child=$!
+	wait $child
+}
+
+cmd_phone() {
+	local sub=${1:-list}
+	[ $# -gt 0 ] && shift
+	case "$sub" in
+	add)
+		[ -n "${1:-}" ] || die "usage: mudi-volte phone add NAME"
+		phone_add "$1"
+		restart_service
+		show_phone "$1"
+		;;
+	del | delete | remove)
+		local sec
+		check_name "${1:-}"
+		sec=$(phone_section "${1:-}")
+		[ -n "$sec" ] || die "no phone named \"${1:-}\""
+		uci delete "mudi-volte.$sec"
+		uci commit mudi-volte
+		restart_service
+		say "Phone \"$1\" removed."
+		;;
+	show | qr)
+		check_name "${1:-}"
+		show_phone "$1"
+		;;
+	screen)
+		check_name "${1:-}"
+		screen_show "$1" "${2:-}"
+		;;
+	screen-loop) screen_loop "$1" "$2" "$3" ;;
+	url)
+		check_name "${1:-}"
+		[ -n "$(phone_section "$1")" ] || die "no phone named \"$1\""
+		phone_url "$1"
+		;;
+	list)
+		local online secure u st
+		online=$(jsonfilter -i "$STATE" -e '@.phones[*]' 2>/dev/null)
+		secure=$(jsonfilter -i "$STATE" -e '@.phones_tls[*]' 2>/dev/null)
+		for u in $(phone_users); do
+			st=offline
+			printf '%s\n' "$online" | grep -qx "$u" && st=online
+			printf '%s\n' "$secure" | grep -qx "$u" && st='online, encrypted'
+			say "$u	$(phone_ext "$u" || echo -)	$st"
+		done
+		;;
+	ext)
+		local sec
+		check_name "${1:-}"
+		sec=$(phone_section "$1")
+		[ -n "$sec" ] || die "usage: mudi-volte phone ext NAME NUMBER (or - to remove)"
+		if [ "${2:-}" = - ]; then
+			uci -q delete "mudi-volte.$sec.ext"
+		else
+			check_ext "${2:-}"
+			local other
+			for other in $(phone_users); do
+				[ "$other" != "$1" ] && [ "$(phone_ext "$other")" = "$2" ] && die "short number $2 belongs to \"$other\""
+			done
+			uci set "mudi-volte.$sec.ext=$2"
+		fi
+		uci commit mudi-volte
+		restart_service
+		if [ "${2:-}" = - ]; then
+			say "Phone \"$1\" has no short number now; other phones call it by name."
+		else
+			say "Phone \"$1\": short number $2."
+		fi
+		;;
+	*) die "usage: mudi-volte phone add NAME | del NAME | show NAME | list | url NAME | ext NAME NUMBER | screen NAME [SECONDS]" ;;
+	esac
+}
+
+# --- commands ---
+
+cmd_setup() {
+	local lte_only=0 phone=phone imsi mcc oper cc mode undo='' made_orig=0
+	case " $* " in
+	*' --detach '*)
+		local a args=''
+		for a in "$@"; do [ "$a" = --detach ] || args="$args $a"; done
+		# shellcheck disable=SC2086
+		detach setup -y $args
+		return 0
+		;;
+	esac
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-y | --yes) YES=1 ;;
+		--lte-only) lte_only=1 ;;
+		--keep-3g) lte_only=0 ;;
+		--phone)
+			phone=${2:-}
+			shift
+			;;
+		*) die "setup: unknown option $1" ;;
+		esac
+		shift
+	done
+
+	say "Checking the router, the modem and the SIM..."
+	check_device
+	imsi=$(at 'AT+CIMI' | grep -oE '[0-9]{15}' | head -n 1)
+	mcc=$(printf '%s' "$imsi" | cut -c1-3)
+	oper=$(at 'AT+COPS?' | sed -n 's/.*+COPS: [0-9],[0-9],"\([^"]*\)".*/\1/p' | head -n 1)
+	say "Modem: Quectel RG650V. SIM operator: ${oper:-unknown} (MCC ${mcc:-?})."
+	say "VoLTE through this router needs an operator that offers VoLTE on your SIM."
+
+	mkdir -p "$DATA"
+	chmod 700 "$DATA"
+	[ -n "$(phone_users)" ] || phone_add "$phone"
+	if [ -z "$(uci -q get mudi-volte.main.country)" ]; then
+		cc=$(country_code "$mcc")
+		[ -n "$cc" ] && uci set "mudi-volte.main.country=$cc"
+	fi
+	uci commit mudi-volte
+
+	mode=$(ims_mode)
+	if [ "$mode" = 2 ]; then
+		say "The modem is already in External VoLTE mode."
+		[ -s "$ORIG" ] || made_orig=1
+		save_orig
+		local cycle=0 mp
+		if ! voice_settings_ok; then
+			say "Switching the modem to IMS-only voice (no 3G fallback for calls)."
+			set_voice_settings || setup_failed
+			cycle=1
+		fi
+		if [ "$lte_only" = 1 ] && mp=$(mode_pref) && [ "$mp" != LTE:NR5G ]; then
+			set_value mode_pref 'QNWPREFCFG="mode_pref"' LTE:NR5G "$mp" || setup_failed
+			cycle=1
+		fi
+		# Only once the modem took every value, as below.
+		power_saving_off
+		uci set mudi-volte.main.enabled=1
+		uci commit mudi-volte
+		if [ "$cycle" = 1 ]; then
+			modem_sync
+			$INIT stop 2>/dev/null
+			say "Reconnecting the modem to the network (the internet blinks for 10-30 seconds)..."
+			radio_cycle
+		fi
+		restart_service
+		wait_registered 180
+		$IMSD status "$STATE"
+		# No passwords here: with --detach this output lands in $SETUP_LOG, which the web page shows.
+		for p in $(phone_users); do say "Phone \"$p\" is set up: 'mudi-volte phone show $p' prints its QR code."; done
+		return 0
+	fi
+
+	cat <<EOF
+
+To handle calls on this router, the modem's own VoLTE client has to be switched
+off ("External VoLTE Stack" mode). The setting stays in the modem, and
+'mudi-volte modem builtin' or 'mudi-volte uninstall' restores it.
+The router restarts once now: Wi-Fi and the internet are down for 2-3 minutes.
+EOF
+	ask "Switch the modem and restart the router now?" Y || die "cancelled; nothing in the modem was changed"
+	[ -s "$ORIG" ] || made_orig=1
+	save_orig
+	# Every value or none: without voice_domain 1 the network may move a call
+	# to 3G. The router's sleep settings and the service change only after the
+	# modem took them all, so that a failed setup leaves the router as it was.
+	set_value ims 'QCFG="ims"' 2 "$mode" &&
+		set_value voice_disable 'QCALLCFG="voice_disable"' 3 "$(voice_disable)" &&
+		set_voice_settings &&
+		{ [ "$lte_only" = 0 ] || set_value mode_pref 'QNWPREFCFG="mode_pref"' LTE:NR5G "$(mode_pref)"; } ||
+		setup_failed
+	power_saving_off
+	uci set mudi-volte.main.enabled=1
+	uci commit mudi-volte
+	$INIT enable
+	cat <<EOF
+
+Restarting now. Reconnect to the router's Wi-Fi in 2-3 minutes, then connect
+your phone by scanning its QR code in Linphone. The code is on the web page
+(GL admin panel > System > Advanced Settings > LuCI > Services > Calls & SMS)
+or in the terminal:
+
+    mudi-volte phone show $(phone_users | head -n 1)
+
+Is it online? mudi-volte status
+EOF
+	restart_router
+}
+
+cmd_status() {
+	if [ "$(uci -q get mudi-volte.main.enabled)" != 1 ]; then
+		say "Not set up yet: run 'mudi-volte setup'."
+		return 3
+	fi
+	$IMSD status "$STATE"
+	local rc=$? n
+	case "$(ims_mode)" in
+	2) say "Modem:   External VoLTE mode" ;;
+	'') say "Modem:   not answering" ;;
+	*) say "Modem:   built-in VoLTE mode: calls cannot reach this router (run 'mudi-volte setup')" ;;
+	esac
+	n=$(grep -c . "$MISSED" 2>/dev/null)
+	[ "${n:-0}" -gt 0 ] && say "Missed:  $n call(s): mudi-volte missed"
+	n=$(uci -q get mudi-volte.main.push_login)
+	[ -n "$n" ] && say "Pushes:  on, account $n (phones: $(push_phones))"
+	return $rc
+}
+
+# The phones that can be woken by a push: Linphone on an iPhone (APNs) or an
+# Android phone (FCM) that has registered at least once since the daemon
+# learnt to keep its push token.
+push_phones() {
+	local f=$DATA/push.json users
+	[ -s "$f" ] && users=$(jsonfilter -i "$f" -e '@[@.provider="apns"].user' -e '@[@.provider="apns.dev"].user' \
+		-e '@[@.provider="fcm"].user' 2>/dev/null | sort -u | tr '\n' ' ')
+	users=${users% }
+	echo "${users:-none yet}"
+}
+
+# push [login NAME | off]: pushes that wake a sleeping Linphone for a call
+# (iOS stops it in the background, Android when it kills its service, and
+# only a push brings it back). A
+# free account from subscribe.linphone.org signs them; its password is asked
+# on the terminal, never taken from the command line, and goes into UCI
+# through stdin.
+cmd_push() {
+	local login pass q
+	case "${1:-}" in
+	'')
+		login=$(uci -q get mudi-volte.main.push_login)
+		if [ -n "$login" ]; then
+			say "Pushes: on, account $login@$(uci -q get mudi-volte.main.push_domain || echo sip.linphone.org)"
+			say "Phones that can be woken: $(push_phones)"
+		else
+			say "Pushes: off. An iPhone gets calls only while Linphone is open, an Android phone while its Linphone service runs."
+			say "Turn them on with a free account from subscribe.linphone.org: mudi-volte push login NAME"
+		fi
+		;;
+	login)
+		login=${2:-}
+		login=${login%@sip.linphone.org}
+		case $login in
+		'' | *[!A-Za-z0-9._+-]*) die "usage: mudi-volte push login NAME (the login of subscribe.linphone.org, without @sip.linphone.org)" ;;
+		esac
+		{ true </dev/tty; } 2>/dev/null || die "the password is asked on a terminal (over ssh: ssh -t)"
+		printf 'Password of %s@sip.linphone.org: ' "$login" >/dev/tty
+		stty -echo </dev/tty 2>/dev/null
+		IFS= read -r pass </dev/tty
+		stty echo </dev/tty 2>/dev/null
+		printf '\n' >/dev/tty
+		[ -n "$pass" ] || die "empty password, nothing changed"
+		# uci batch reads the value from stdin: it never shows up in a command line.
+		q=$(printf '%s' "$pass" | sed "s/'/'\\\\''/g")
+		printf "set mudi-volte.main.push_login='%s'\nset mudi-volte.main.push_password='%s'\ncommit mudi-volte\n" "$login" "$q" | uci batch >/dev/null ||
+			die "could not save the account"
+		pass='' q=''
+		say "Pushes on, account $login@sip.linphone.org. Restarting the service (calls are offline for about 10 seconds)..."
+		restart_service
+		;;
+	off)
+		uci -q delete mudi-volte.main.push_login
+		uci -q delete mudi-volte.main.push_password
+		uci commit mudi-volte
+		say "Pushes off. Restarting the service..."
+		restart_service
+		;;
+	*) die "usage: mudi-volte push [login NAME | off]" ;;
+	esac
+}
+
+# missed [clear]: incoming calls that nobody answered, newest first. The
+# daemon writes them with full numbers (the log masks them); 'clear' empties
+# the list.
+cmd_missed() {
+	case "${1:-}" in
+	'') $IMSD missed "$MISSED" ;;
+	clear)
+		[ -s "$MISSED" ] && : >"$MISSED"
+		say "The list of missed calls is empty."
+		;;
+	*) die "usage: mudi-volte missed [clear]" ;;
+	esac
+}
+
+# sms [--json]: SMS to the SIM, newest first: the ones the modem received
+# (GL's smsd spool, the SMS page of the GL admin panel) and the ones that came
+# over IMS. Read only; the GL admin panel deletes them.
+cmd_sms() {
+	local spool zone json=
+	case "${1:-}" in
+	'') ;;
+	--json) json=-json ;;
+	*) die "usage: mudi-volte sms [--json]" ;;
+	esac
+	spool=$(sed -n 's/^incoming *= *\(\/.*\)/\1/p' /tmp/smstools.cfg 2>/dev/null | head -n 1)
+	zone=$(uci -q get system.@system[0].zonename | tr ' ' '_')
+	# Times in the router's time zone (the daemon carries the zone database).
+	env ${zone:+TZ="$zone"} $IMSD sms $json "${spool:-/etc/spool/sms/incoming}" "$SMS_INBOX"
+}
+
+cmd_modem() {
+	case "${1:-status}" in
+	status)
+		say "IMS mode:      $(ims_mode) (2 = External VoLTE stack, as mudi-volte needs)"
+		say "voice_disable: $(voice_disable)"
+		say "mode_pref:     $(mode_pref)"
+		say "voice_domain:  $(voice_domain) (1 = IMS voice only, as mudi-volte sets)"
+		say "ue_usage:      $(ue_usage) (1 = data centric)"
+		if [ -s "$ORIG" ]; then say "Saved original: $(tr '\n' ' ' <"$ORIG")"; fi
+		;;
+	builtin)
+		case " $* " in *' --detach '*)
+			detach modem builtin -y
+			return 0
+			;;
+		esac
+		[ "${2:-}" = -y ] && YES=1
+		restore_builtin
+		;;
+	*) die "usage: mudi-volte modem [status | builtin]" ;;
+	esac
+}
+
+# give_back NAME SETTING VALUE OLD: one write of modem_give_back. OLD, the
+# value read just before, goes on top of its undo list.
+give_back() {
+	if [ -z "$4" ]; then
+		warn "could not read $1 before restoring it"
+		return 1
+	fi
+	if ! at_set "AT+$2,$3"; then
+		warn "could not restore $1 $3"
+		return 1
+	fi
+	undo="AT+$2,$4
+$undo"
+}
+
+# modem_give_back: write the modem's own VoLTE settings back: the ones saved by
+# setup, or the factory ones for a modem that was external without a backup.
+# They take effect when the modem restarts, so the service may run meanwhile.
+# Fails when the modem does not answer or refuses a value; the values written
+# by then are set back, so that the External VoLTE line keeps working after a
+# restart too. MODE_BEFORE keeps the modem's mode from before (2 = external).
+modem_give_back() {
+	local mode ims vd mp vdom ue cur='' undo=''
+	mode=$(ims_mode)
+	MODE_BEFORE=$mode
+	if [ -z "$mode" ]; then
+		warn "the modem is not answering"
+		return 1
+	fi
+	ims=$(orig ims) vd=$(orig voice_disable) mp=$(orig mode_pref) vdom=$(orig voice_domain) ue=$(orig ue_usage)
+	if [ ! -s "$ORIG" ]; then
+		[ "$mode" = 2 ] || return 0 # setup never switched it: nothing to give back
+		ims=0 vd=3 vdom=3 ue=0      # external without a backup: the same factory fallback as save_orig
+	fi
+	if [ -n "$mp" ]; then
+		cur=$(mode_pref)
+		[ "$mp" = "$cur" ] && mp=''
+	fi
+	if give_back ims 'QCFG="ims"' "${ims:-0}" "$mode" &&
+		give_back voice_disable 'QCALLCFG="voice_disable"' "${vd:-3}" "$(voice_disable)" &&
+		{ [ -z "$mp" ] || give_back mode_pref 'QNWPREFCFG="mode_pref"' "$mp" "$cur"; } &&
+		{ [ -z "$vdom" ] || give_back voice_domain 'QNWPREFCFG="voice_domain"' "$vdom" "$(voice_domain)"; } &&
+		{ [ -z "$ue" ] || give_back ue_usage_setting 'QNWPREFCFG="ue_usage_setting"' "$ue" "$(ue_usage)"; }; then
+		# Committed at once: after a removal by opkg the router restarts by the
+		# user's hand, perhaps within seconds, and the modem's own VoLTE has to
+		# be there after it.
+		modem_sync
+		return 0
+	fi
+	[ -n "$undo" ] || return 1
+	if undo_writes; then
+		warn "the values written so far are set back: the modem stays in External VoLTE mode"
+	else
+		warn "could not set them back either: the modem holds some values of each mode until a restore or setup succeeds"
+	fi
+	return 1
+}
+
+# restore_builtin [remove | package]: give VoLTE back to the modem and restart
+# the router. "remove" (uninstall) removes the package and its data before the
+# restart. "package" is the package's prerm on a removal by opkg: no question
+# and no restart (opkg and the web page that runs it have to finish), opkg
+# removes the package and postrm the data.
+restore_builtin() {
+	[ "${1:-}" = package ] ||
+		ask "Restore the modem's own VoLTE and restart the router (2-3 minutes offline)?" Y || die "cancelled"
+	# The service stops only once the modem has taken every value: a failed
+	# restore leaves the phone line working.
+	modem_give_back || die "the modem's own VoLTE is not restored; the service, the package and the settings are kept: retry when the modem answers"
+	$INIT stop 2>/dev/null
+	# procd gives the daemon 30 s for its de-REGISTER, and until it exits it
+	# may still write to $DATA, which a removal deletes next.
+	local i=0
+	while service_running && [ "$i" -lt 35 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	$INIT disable 2>/dev/null
+	uci -q set mudi-volte.main.enabled=0 && uci -q commit mudi-volte
+	power_saving_restore
+	if [ "${1:-}" = package ]; then
+		[ "$MODE_BEFORE" = 2 ] && say "The modem has its own VoLTE settings back; they take effect when the router restarts." &&
+			say "Restart the router once the removal is done: until then no calls reach the SIM."
+		return 0
+	fi
+	if [ "${1:-}" = remove ]; then
+		# Tells the package's prerm and postrm that this command restores the
+		# modem and removes the data itself.
+		export MUDI_VOLTE_UNINSTALL=1
+		opkg remove mudi-volte >/dev/null || die "opkg remove failed; settings kept"
+		say "Package removed."
+		rm -rf "$DATA"
+		# opkg leaves an edited /etc/config/mudi-volte behind, and that file holds
+		# the phones' SIP passwords and the allowed numbers.
+		if [ "${KEEP_CONFIG:-0}" = 1 ]; then
+			say "Settings and phones are kept in /etc/config/mudi-volte."
+		else
+			rm -f /etc/config/mudi-volte /etc/config/mudi-volte-opkg
+			say "Settings and phones removed."
+		fi
+	fi
+	say "Restarting the router..."
+	restart_router
+}
+
+cmd_uninstall() {
+	KEEP_CONFIG=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-y | --yes) YES=1 ;;
+		--keep-config) KEEP_CONFIG=1 ;;
+		*) die "uninstall: unknown option $1" ;;
+		esac
+		shift
+	done
+	restore_builtin remove
+}
+
+case "${1:-}" in
+setup)
+	shift
+	cmd_setup "$@"
+	;;
+status) cmd_status ;;
+missed)
+	shift
+	cmd_missed "$@"
+	;;
+sms)
+	shift
+	cmd_sms "$@"
+	;;
+phone | phones)
+	shift
+	cmd_phone "$@"
+	;;
+push)
+	shift
+	cmd_push "$@"
+	;;
+logs | log)
+	# The service keeps its own log: logread on the Mudi holds only minutes.
+	if [ ! -f "$LOG" ]; then
+		if [ "${2:-}" = -f ]; then logread -f -e mudi-imsd; else logread -e mudi-imsd; fi
+	elif [ "${2:-}" = -f ]; then
+		tail -n 40 -f "$LOG"
+	elif [ "${2:-}" = -a ]; then
+		cat "$LOG.1" "$LOG" 2>/dev/null
+	else
+		cat "$LOG.1" "$LOG" 2>/dev/null | tail -n 200
+	fi
+	;;
+start | stop | restart) $INIT "$1" ;;
+modem)
+	shift
+	cmd_modem "$@"
+	;;
+uninstall)
+	shift
+	cmd_uninstall "$@"
+	;;
+# Not for people: the package's prerm runs it when opkg removes the package.
+package-removal) restore_builtin package ;;
+# Not for people: the background run of the web pages (detach).
+detached)
+	shift
+	detached "$@"
+	;;
+version) say "mudi-volte $VERSION (daemon $($IMSD version 2>/dev/null))" ;;
+-h | --help | help | '') usage ;;
+*) usage 2 ;;
+esac
